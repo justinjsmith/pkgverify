@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"math"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -24,11 +25,14 @@ const (
 )
 
 var (
-	file        = flag.String("f", "", "the file to verify")
-	certificate = flag.String("c", "", "the certificate to use for signature verification")
-	url         = flag.String("u", "", "the URL to check for obtaining the certificate")
+	file        = flag.String("file", "", "the file to verify")
+	certificate = flag.String("cert", "", "the certificate to use for signature verification")
+	url         = flag.String("url", "", "the URL to check for obtaining the signing certificate")
+	root_dir    = flag.String("root-dir", "", "the path to a directory containing rootCAs")
 	exitCode    = 0
 )
+
+var rootPool *x509.CertPool
 
 type Manifest struct {
 	Company     string `json:",omitempty"`
@@ -40,7 +44,7 @@ type Manifest struct {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "\nusage: pkgverify -f [path] -c [path]\n")
+	fmt.Fprintf(os.Stderr, "\nusage: pkgverify -file [path] -cert [path]\n")
 	flag.PrintDefaults()
 	fmt.Fprintf(os.Stderr, "\n")
 	os.Exit(2)
@@ -95,22 +99,30 @@ func pkgVerifyMain() {
 		return
 	}
 
-	// open the certificate file and parse it (from a file to start with)
-	certBytes, err := ioutil.ReadFile(*certificate)
+	// read the signing certificate from a file
+	cert, err := readCertFile(*certificate)
 	if err != nil {
 		report(err)
 		return
 	}
-	pemBlock, _ := pem.Decode(certBytes)
-	if pemBlock == nil {
-		report(fmt.Errorf("No PEM block found"))
-		return
-	}
-	cert, err := x509.ParseCertificate(pemBlock.Bytes)
+
+	// load the root CAs from a directory
+	rootPool = x509.NewCertPool()
+	err = filepath.Walk(*root_dir, loadRootFiles)
 	if err != nil {
 		report(err)
 		return
 	}
+	// verify the certificate is signed by trusted roots
+	opts := x509.VerifyOptions{
+		Roots: rootPool,
+	}
+	_, err = cert.Verify(opts)
+	if err != nil {
+		report(err)
+		return
+	}
+
 	rsaPub, ok := cert.PublicKey.(*rsa.PublicKey)
 	if !ok {
 		report(fmt.Errorf("Not an RSA public key"))
@@ -143,10 +155,43 @@ func pkgVerifyMain() {
 		return
 	}
 
-	fmt.Println("Success!")
-	fmt.Printf("File %s verified against %s\n", fileToVerify.Name(),
+	fmt.Println("\nSuccess!")
+	fmt.Printf("File %s verified against %s\n\n", fileToVerify.Name(),
 		fileToVerify.Name()+".manifest")
 
+}
+
+func readCertFile(path string) (*x509.Certificate, error) {
+	certBytes, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pemBlock, _ := pem.Decode(certBytes)
+	if pemBlock == nil {
+		return nil, err
+	}
+	cert, err := x509.ParseCertificate(pemBlock.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return cert, nil
+}
+
+// load all the certificates in a directory. This should include any
+// intermediate CAs
+func loadRootFiles(path string, info os.FileInfo, a_err error) error {
+	if a_err != nil {
+		return a_err
+	}
+	if info.IsDir() {
+		return nil
+	}
+	cert, err := readCertFile(path)
+	if err != nil {
+		return err
+	}
+	rootPool.AddCert(cert)
+	return nil
 }
 
 func calcSha(fileToVerify *os.File) []byte {
